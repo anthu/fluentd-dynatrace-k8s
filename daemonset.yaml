@@ -1,0 +1,205 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fluentd
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: fluentd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluentd
+  namespace: fluentd
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: fluentd
+roleRef:
+  kind: ClusterRole
+  name: fluentd
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+- kind: ServiceAccount
+  name: fluentd
+  namespace: fluentd
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: fluentd
+data:
+  fluent.conf: |
+    @include containers.conf
+    <label @FLUENT_LOG>
+      <match fluent.**>
+        @type null
+        @id ignore_fluent_logs
+      </match>
+    </label>
+    <match fluent.**>
+      @type null
+    </match>
+    <match var.log.containers.nginx-ingress-controller**>
+      @type null
+    </match>
+    <match var.log.containers.grafana**>
+      @type null
+    </match>
+    <match var.log.containers.prometheus**>
+      @type null
+    </match>
+  containers.conf: |
+    <source>
+      @type tail
+      @id in_tail_container_logs
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag "#{ENV['FLUENT_CONTAINER_TAIL_TAG'] || 'kubernetes.*'}"
+      exclude_path ["/var/log/containers/fluentd*","/var/log/containers/grafa*","/var/log/containers/pro*","/var/log/containers/ng*","/var/log/containers/kub*","/var/log/containers/alb*","/var/log/containers/**_staging_**"]
+      read_from_head true
+      <parse>
+        @type cri
+      </parse>
+    </source>
+
+    <filter kubernetes.**>
+      @type kubernetes_metadata
+    </filter>
+
+    <filter kubernetes.**>
+      @type record_transformer
+      enable_ruby true
+      <record>
+        container.name ${record.dig("kubernetes","container_name")}
+        container.image.name ${record.dig("kubernetes","container_image").split(':')[0]}
+        container.image.tag ${record.dig("kubernetes","container_image").split(':')[1]}
+        dt.kubernetes.node.name ${record.dig("kubernetes","host")}
+        k8s.namespace.name ${record.dig("kubernetes","namespace_name")}
+        k8s.pod.name ${record.dig("kubernetes","pod_name")}
+        k8s.pod.uid ${record.dig("kubernetes","pod_id")}
+      </record>
+      remove_keys log, stream, docker, kubernetes
+    </filter>
+
+    <filter kubernetes.var.log.containers.traefik**>
+      @type parser
+      key_name message
+      hash_value_field content
+      reserve_data true
+      remove_key_name_field true
+      <parse>
+        @type json
+      </parse>
+    </filter>
+
+    <filter kubernetes.var.log.containers.traefik**>
+      @type record_transformer
+      enable_ruby true
+      <record>
+        message ${record.dig("content","msg")}
+        level ${record.dig("content","level")}
+      </record>
+      remove_keys content
+    </filter>
+
+    <filter kubernetes.var.log.containers.dynatrace-operator**>
+      @type parser
+      key_name message
+      hash_value_field content
+      reserve_data true
+      remove_key_name_field true
+      <parse>
+        @type json
+      </parse>
+    </filter>
+
+    <filter kubernetes.var.log.containers.dynatrace-operator**>
+      @type record_transformer
+      enable_ruby true
+      <record>
+        message ${record.dig("content","msg")}
+        level ${record.dig("content","level")}
+        log.source ${record.dig("content","logger")}
+      </record>
+      remove_keys content
+    </filter>
+
+    <match **>
+      @type              dynatrace
+      active_gate_url    "#{ENV['DT_URL']}"
+      api_token          "#{ENV['DT_TOKEN']}"
+      ssl_verify_none    true
+      <buffer>
+        chunk_limit_size 1048576
+        retry_max_times 3
+      </buffer>
+    </match>
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: fluentd
+  labels:
+    k8s-app: fluentd-logging
+    version: v1
+spec:
+  selector:
+    matchLabels:
+      k8s-app: fluentd-logging
+      version: v1
+  template:
+    metadata:
+      labels:
+        k8s-app: fluentd-logging
+        version: v1
+    spec:
+      serviceAccount: fluentd
+      serviceAccountName: fluentd
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: fluentd
+        image: anhu/fluentd-dynatrace:0.6.0
+        imagePullPolicy: Always
+        env:
+          - name:  DT_URL
+            value: "https://<ActiveGate URL>:9999/e/<Tenant>/api/v2/logs/ingest"
+          - name: DT_TOKEN
+            value: "<Dynatrace Token with LogIngest Permissions>"
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: config
+          mountPath: /fluentd/etc
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: config
+        configMap:
+          name: fluentd-config
